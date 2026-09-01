@@ -1,4 +1,4 @@
-﻿using DotNetty.Common.Internal.Logging;
+using DotNetty.Common.Internal.Logging;
 using DotNetty.Transport.Channels;
 using RT.Common;
 using RT.Cryptography;
@@ -301,21 +301,35 @@ namespace Server.Medius
 
         public DMEObject GetFreeDme(int appId, int preferredLocation)
         {
-            var channels = _scertHandler.GetChannels();
+            var dmes = _channelDatas.Values
+                .Select(d => d?.ClientObject as DMEObject)
+                .Where(dme => dme != null && dme.IsConnected && (dme.ApplicationId == appId || dme.ApplicationId == 0))
+                .ToList();
+
+            if (Program.Manager != null)
+            {
+                var mgrDmes = Program.Manager.GetDmeClients(appId);
+                if (mgrDmes != null)
+                {
+                    foreach (var d in mgrDmes)
+                    {
+                        if (d != null && d.IsConnected && !dmes.Contains(d))
+                            dmes.Add(d);
+                    }
+                }
+            }
+
+            if (dmes.Count == 0)
+                return null;
 
             // get by location & app id
-            var dme = channels
-                .Select(x => _channelDatas[x.Id.AsLongText()]?.ClientObject)
-                .Where(x => x is DMEObject && x != null && (x as DMEObject).Location == preferredLocation && (x.ApplicationId == appId || x.ApplicationId == 0))
-                .MinBy(x => (x as DMEObject).CurrentWorlds) as DMEObject;
+            var match = dmes
+                .Where(dme => dme.Location == preferredLocation)
+                .MinBy(dme => dme.CurrentWorlds);
 
-            // if that fails get by app id only
-            dme ??= channels
-                .Select(x => _channelDatas[x.Id.AsLongText()]?.ClientObject)
-                .Where(x => x is DMEObject && x != null && (x.ApplicationId == appId || x.ApplicationId == 0))
-                .MinBy(x => (x as DMEObject).CurrentWorlds) as DMEObject;
+            match ??= dmes.MinBy(dme => dme.CurrentWorlds);
 
-            return dme;
+            return match;
         }
 
         public DMEObject ReserveDMEObject(MediusServerSessionBeginRequest request)

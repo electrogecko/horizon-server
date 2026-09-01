@@ -1,4 +1,4 @@
-﻿using DotNetty.Common.Internal.Logging;
+using DotNetty.Common.Internal.Logging;
 using RT.Common;
 using RT.Models;
 using Server.Medius.Models;
@@ -120,6 +120,27 @@ namespace Server.Medius
             }
 
             return null;
+        }
+
+        public IEnumerable<DMEObject> GetDmeClients(int appId)
+        {
+            var list = new List<DMEObject>();
+            var appIdsInGroup = GetAppIdsInGroup(appId);
+
+            foreach (var appIdInGroup in appIdsInGroup)
+            {
+                if (_lookupsByAppId.TryGetValue(appIdInGroup, out var quickLookup))
+                {
+                    list.AddRange(quickLookup.SessionKeyToDmeClient.Values);
+                }
+            }
+
+            if (_lookupsByAppId.TryGetValue(0, out var globalLookup))
+            {
+                list.AddRange(globalLookup.SessionKeyToDmeClient.Values);
+            }
+
+            return list;
         }
 
         public void AddDmeClient(DMEObject dmeClient)

@@ -165,8 +165,15 @@ namespace Server.Dme
                 case RT_MSG_CLIENT_CONNECT_AUX_UDP connectAuxUdp:
                     {
                         var clientObject = Program.TcpServer.GetClientByScertId(connectAuxUdp.ScertId);
+                        // HOTJOIN DIAG: this handshake had no logging at all, and failed
+                        // hot-join attempts abort client-side exactly when the accept never
+                        // lands. Log both the guard rejection and the accept send.
                         if (clientObject != ClientObject && ClientObject.DmeId != connectAuxUdp.PlayerId)
+                        {
+                            Logger.Warn($"CONNECT_AUX_UDP REJECTED from {packet.Source} scertId:{connectAuxUdp.ScertId} playerId:{connectAuxUdp.PlayerId} (expected client dmeId:{ClientObject?.DmeId} scertId:{ClientObject?.ScertId})");
                             break;
+                        }
+                        Logger.Info($"CONNECT_AUX_UDP from {packet.Source} scertId:{connectAuxUdp.ScertId} playerId:{connectAuxUdp.PlayerId} port:{Port} -> sending ACCEPT_AUX_UDP x3");
 
                         //
                         AuthenticatedEndPoint = packet.Source;
@@ -183,8 +190,11 @@ namespace Server.Dme
                             EndPoint = ClientObject.RemoteUdpEndpoint
                         };
 
-                        // Send it twice in case of packet loss
-                        //_boundChannel.WriteAndFlushAsync(new ScertDatagramPacket(msg, packet.Source));
+                        // Send redundantly in case of packet loss -- the client aborts the
+                        // join within ~300ms if this accept never arrives, and the reply
+                        // was previously sent exactly once.
+                        _boundChannel.WriteAndFlushAsync(new ScertDatagramPacket(msg, packet.Source));
+                        _boundChannel.WriteAndFlushAsync(new ScertDatagramPacket(msg, packet.Source));
                         _boundChannel.WriteAndFlushAsync(new ScertDatagramPacket(msg, packet.Source));
                         break;
                     }

@@ -1,4 +1,4 @@
-﻿using DotNetty.Common.Internal.Logging;
+using DotNetty.Common.Internal.Logging;
 using Microsoft.Extensions.Logging;
 using RT.Common;
 using RT.Models;
@@ -74,6 +74,42 @@ namespace Server.Dme.Models
         public void UnregisterClientIndex(int index)
         {
             _pIdIsUsed[index] = false;
+        }
+
+
+        // PROBE ONLY: a joiner polls the host with 02-13 and waits for the host to answer
+        // 02-12 before it will finish joining. Captured from a working staging join:
+        //
+        //   joiner -> 02-13 (x10, ~150ms apart)
+        //   host   -> 00-0F, 00-04, 02-12-00-00-00-00
+        //   joiner -> 02-13 (x4), host -> 00-03
+        //   joiner -> 02-11            (joined)
+        //
+        // An in-game host never sends 02-12, because that responder lives in the staging
+        // loop. The joiner then aborts after three polls (dropping RECV_BROADCAST and
+        // sending 00-12-01 twice) and disconnects. Answer on the host's behalf and flush
+        // immediately -- the joiner's whole attempt lasts ~10ms, so a queued reply that
+        // waits for the next aggregation window would arrive after it has already given up.
+        private static readonly byte[] HOTJOIN_POLL_ANSWER = new byte[] { 0x02, 0x12, 0x00, 0x00, 0x00, 0x00 };
+
+        private void TryAnswerHotjoinPoll(ClientObject source, short targetDmeId, byte[] payload)
+        {
+            // Only a non-host polling the host, and only while the host is actually in-game
+            // (_hotjoinInGame is set when we clamp an in-game roster for this world).
+            if (!_hotjoinInGame || source == null || source.DmeId == 0 || targetDmeId != 0) return;
+            if (payload == null || payload.Length < 2 || payload[0] != 0x02 || payload[1] != 0x13) return;
+
+            var reply = new RT_MSG_CLIENT_APP_SINGLE()
+            {
+                TargetOrSource = 0,
+                Payload = HOTJOIN_POLL_ANSWER
+            };
+
+            var tcp = source.Tcp;
+            if (tcp == null || !tcp.Active) return;
+
+            _ = tcp.WriteAndFlushAsync(reply);
+            Logger.Info($"HOTJOIN PROBE: answered 02-13 poll from client {source.DmeId} with 02-12 for world {WorldId}");
         }
 
         #endregion
@@ -178,6 +214,111 @@ namespace Server.Dme.Models
             }
         }
 
+        #region Hotjoin probe
+
+
+        // PROBE ONLY: caches the staging name a client announces in its 00-0F broadcast,
+        // keyed by DmeId, so we can fill it into a roster slot we inject below.
+        private readonly ConcurrentDictionary<int, string> _hotjoinNames = new ConcurrentDictionary<int, string>();
+
+        // Verified wire offsets inside the tNW_GameSettings blob (base = index of
+        // "tNW_GameSetting" + 16). Only the first 0x100 bytes are confirmed to match
+        // the in-memory GameSettings layout, so we touch nothing past PlayerStates.
+        private const int GS_NAMES = 0x00;   // char[8][16]
+        private const int GS_SKINS = 0xC0;   // short[8]
+        private const int GS_TEAMS = 0xD0;   // short[8]
+        private const int GS_CLIENTS = 0xE0; // short[8]
+        private const int GS_STATES = 0xF0;  // short[8]
+
+        // Set once we have seen this world's host report an in-game roster.
+        private volatile bool _hotjoinInGame = false;
+
+        private const int GS_PLAYER_STATE_READY = 6;
+        private const int GS_PLAYER_STATE_GAME_START = 7;
+
+        private static readonly byte[] GS_TYPENAME = Encoding.ASCII.GetBytes("tNW_GameSetting");
+
+        private static int IndexOfPattern(byte[] haystack, byte[] needle)
+        {
+            for (int i = 0; i + needle.Length <= haystack.Length; ++i)
+            {
+                int j = 0;
+                while (j < needle.Length && haystack[i + j] == needle[j]) ++j;
+                if (j == needle.Length) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>
+        /// PROBE ONLY: rewrites a tNW_GameSettings payload on its way from the in-game host
+        /// to a late joiner, inserting a roster slot for that joiner. Tests whether the
+        /// joiner's immediate bail is caused by finding itself absent from the roster.
+        /// Returns the original array unchanged if this is not a settings payload.
+        /// </summary>
+        private byte[] TryInjectHotjoinSlot(byte[] payload, int slot)
+        {
+            if (payload == null || slot <= 0 || slot >= 8) return payload;
+            if (payload.Length < 3 || payload[0] != 0x00 || payload[1] != 0x16 || payload[2] != 0x05) return payload;
+
+            int at = IndexOfPattern(payload, GS_TYPENAME);
+            if (at < 0) return payload;
+
+            int gs = at + 16;
+            if (gs + GS_STATES + (slot * 2) + 2 > payload.Length) return payload;
+
+            // Only rewrite when the host is actually in-game. An in-game host reports
+            // PlayerStates[0] == 8 (one past GS_PLAYER_STATE_GAME_START). Without this
+            // guard the probe would also rewrite ordinary staging joins and corrupt them.
+            int hostState = payload[gs + GS_STATES] | (payload[gs + GS_STATES + 1] << 8);
+            if (hostState < 7) return payload;
+
+            _hotjoinInGame = true;
+
+            var patched = (byte[])payload.Clone();
+
+            _hotjoinNames.TryGetValue(slot, out var name);
+            if (string.IsNullOrEmpty(name)) name = "Hotjoin" + slot;
+            var nameBytes = Encoding.ASCII.GetBytes(name);
+            for (int i = 0; i < 16; ++i)
+                patched[gs + GS_NAMES + (slot * 16) + i] = i < nameBytes.Length ? nameBytes[i] : (byte)0;
+
+            void WriteShort(int arrayOff, short value)
+            {
+                patched[gs + arrayOff + (slot * 2)] = (byte)(value & 0xFF);
+                patched[gs + arrayOff + (slot * 2) + 1] = (byte)((value >> 8) & 0xFF);
+            }
+
+            WriteShort(GS_SKINS, 0);
+            WriteShort(GS_TEAMS, 0);
+            WriteShort(GS_CLIENTS, (short)slot); // PlayerClients[slot] = the joiner's client id
+            // Keep the joiner UNREADY. Presenting it as READY was tried and is strictly
+            // worse: the staging screen then faults at 0x199c6c within two frames instead
+            // of surviving staging and reaching the level load.
+            WriteShort(GS_STATES, 0);            // GS_PLAYER_STATE_UNREADY
+
+            // Clamp the in-game host's undocumented state 8 down to GAME_START (7), NOT
+            // to READY. The joiner's staging handler decides whether to start loading with
+            //     lh v0,240(a1) ; slti v0,v0,7 ; beqz v0 -> start-game path (jal 0x6c1930)
+            // so state >= 7 IS the load trigger. Clamping to READY (6) held the joiner in
+            // staging forever at "0/8" -- it was our own clamp suppressing the transition
+            // we want. 7 satisfies the trigger while staying inside the documented enum.
+            for (int i = 0; i < 8; ++i)
+            {
+                int off = gs + GS_STATES + (i * 2);
+                int st = payload[off] | (payload[off + 1] << 8);
+                if (st > GS_PLAYER_STATE_GAME_START)
+                {
+                    patched[off] = (byte)GS_PLAYER_STATE_GAME_START;
+                    patched[off + 1] = 0;
+                }
+            }
+
+            Logger.Info($"HOTJOIN PROBE: injected roster slot {slot} (\"{name}\") and clamped in-game states -> GAME_START for world {WorldId}");
+            return patched;
+        }
+
+        #endregion
+
         #region Send
 
         public void BroadcastTcp(ClientObject source, byte[] Payload)
@@ -195,6 +336,18 @@ namespace Server.Dme.Models
 
                 client.Value.EnqueueTcp(msg);
             }
+
+            // PROBE ONLY: remember the staging name a joining client announces (00-0F),
+            // so an injected roster slot can carry the real name.
+            if (Payload != null && Payload.Length >= 40 && source.DmeId != 0
+                && Payload[0] == 0x00 && Payload[1] == 0x0F)
+            {
+                int end = 24;
+                while (end < Payload.Length && end < 24 + 16 && Payload[end] != 0) ++end;
+                if (end > 24)
+                    _hotjoinNames[source.DmeId] = Encoding.ASCII.GetString(Payload, 24, end - 24);
+            }
+
         }
 
         public void BroadcastUdp(ClientObject source, byte[] Payload)
@@ -255,14 +408,23 @@ namespace Server.Dme.Models
         {
             var target = Clients.FirstOrDefault(x => x.Value.DmeId == targetDmeId).Value;
 
+            // PROBE ONLY: when the in-game host answers a late joiner's handshake with a
+            // tNW_GameSettings snapshot, that snapshot has no slot for the joiner. Inject one
+            // on the way through and see whether the joiner still bails.
+            var outgoing = Payload;
+            if (source.DmeId == 0 && targetDmeId > 0)
+                outgoing = TryInjectHotjoinSlot(Payload, targetDmeId);
+
             if (target != null && target.IsAuthenticated && target.IsConnected && target.HasRecvFlag(RT_RECV_FLAG.RECV_SINGLE))
             {
                 target.EnqueueTcp(new RT_MSG_CLIENT_APP_SINGLE()
                 {
                     TargetOrSource = (short)source.DmeId,
-                    Payload = Payload
+                    Payload = outgoing
                 });
             }
+
+            TryAnswerHotjoinPoll(source, targetDmeId, Payload);
         }
 
         public void SendUdpAppSingle(ClientObject source, short targetDmeId, byte[] Payload)

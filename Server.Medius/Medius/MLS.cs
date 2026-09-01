@@ -1,4 +1,4 @@
-﻿using DotNetty.Common.Internal.Logging;
+using DotNetty.Common.Internal.Logging;
 using DotNetty.Transport.Channels;
 using RT.Common;
 using RT.Cryptography;
@@ -2429,7 +2429,7 @@ namespace Server.Medius
                                     GameStats = x.GameStats,
                                     GenericField1 = x.GenericField1,
                                     GenericField2 = x.GenericField2,
-                                    GenericField3 = x.GenericField3,
+                                    GenericField3 = x.WorldStatus == MediusWorldStatus.WorldActive ? (int)((uint)x.GenericField3 & 0x0FFFFFFF) : x.GenericField3,
                                     GenericField4 = x.GenericField4,
                                     GenericField5 = x.GenericField5,
                                     GenericField6 = x.GenericField6,
@@ -2442,7 +2442,7 @@ namespace Server.Medius
                                     PlayerSkillLevel = x.PlayerSkillLevel,
                                     RulesSet = x.RulesSet,
                                     SecurityLevel = (String.IsNullOrEmpty(x.GamePassword) ? MediusWorldSecurityLevelType.WORLD_SECURITY_NONE : MediusWorldSecurityLevelType.WORLD_SECURITY_PLAYER_PASSWORD),
-                                    WorldStatus = x.WorldStatus,
+                                    WorldStatus = x.WorldStatus == MediusWorldStatus.WorldActive ? MediusWorldStatus.WorldStaging : x.WorldStatus,
                                     EndOfList = false
                                 }).ToArray();
 
@@ -2493,7 +2493,7 @@ namespace Server.Medius
                                     GameStats = x.GameStats,
                                     GenericField1 = x.GenericField1,
                                     GenericField2 = x.GenericField2,
-                                    GenericField3 = x.GenericField3,
+                                    GenericField3 = x.WorldStatus == MediusWorldStatus.WorldActive ? (int)((uint)x.GenericField3 & 0x0FFFFFFF) : x.GenericField3,
                                     MaxPlayers = (ushort)x.MaxPlayers,
                                     MediusWorldID = x.Id,
                                     MinPlayers = (ushort)x.MinPlayers,
@@ -2501,7 +2501,7 @@ namespace Server.Medius
                                     PlayerSkillLevel = x.PlayerSkillLevel,
                                     RulesSet = x.RulesSet,
                                     SecurityLevel = (String.IsNullOrEmpty(x.GamePassword) ? MediusWorldSecurityLevelType.WORLD_SECURITY_NONE : MediusWorldSecurityLevelType.WORLD_SECURITY_PLAYER_PASSWORD),
-                                    WorldStatus = x.WorldStatus,
+                                    WorldStatus = x.WorldStatus == MediusWorldStatus.WorldActive ? MediusWorldStatus.WorldStaging : x.WorldStatus,
                                     EndOfList = false
                                 }).ToArray();
 
@@ -2558,7 +2558,7 @@ namespace Server.Medius
                                     GameStats = game.GameStats,
                                     GenericField1 = game.GenericField1,
                                     GenericField2 = game.GenericField2,
-                                    GenericField3 = game.GenericField3,
+                                    GenericField3 = game.WorldStatus == MediusWorldStatus.WorldActive ? (int)((uint)game.GenericField3 & 0x0FFFFFFF) : game.GenericField3,
                                     GenericField4 = game.GenericField4,
                                     GenericField5 = game.GenericField5,
                                     GenericField6 = game.GenericField6,
@@ -2569,7 +2569,7 @@ namespace Server.Medius
                                     PlayerCount = (ushort)game.PlayerCount,
                                     PlayerSkillLevel = game.PlayerSkillLevel,
                                     RulesSet = game.RulesSet,
-                                    WorldStatus = game.WorldStatus,
+                                    WorldStatus = game.WorldStatus == MediusWorldStatus.WorldActive ? MediusWorldStatus.WorldStaging : game.WorldStatus,
                                     ApplicationID = data.ApplicationId
                                 });
                             }
@@ -2609,13 +2609,13 @@ namespace Server.Medius
                                     GameStats = game.GameStats,
                                     GenericField1 = game.GenericField1,
                                     GenericField2 = game.GenericField2,
-                                    GenericField3 = game.GenericField3,
+                                    GenericField3 = game.WorldStatus == MediusWorldStatus.WorldActive ? (int)((uint)game.GenericField3 & 0x0FFFFFFF) : game.GenericField3,
                                     MaxPlayers = (ushort)game.MaxPlayers,
                                     MinPlayers = (ushort)game.MinPlayers,
                                     PlayerCount = (ushort)game.PlayerCount,
                                     PlayerSkillLevel = game.PlayerSkillLevel,
                                     RulesSet = game.RulesSet,
-                                    WorldStatus = game.WorldStatus,
+                                    WorldStatus = game.WorldStatus == MediusWorldStatus.WorldActive ? MediusWorldStatus.WorldStaging : game.WorldStatus,
                                     ApplicationID = data.ApplicationId
                                 });
                             }
