@@ -221,6 +221,14 @@ namespace Server.Dme.Models
         // keyed by DmeId, so we can fill it into a roster slot we inject below.
         private readonly ConcurrentDictionary<int, string> _hotjoinNames = new ConcurrentDictionary<int, string>();
 
+        // Same names, keyed by session and shared across worlds. The per-world cache is
+        // empty for the first injection into a NEW world, which is why a remade game or a
+        // rejoin showed up on the joiner's screen as "Hotjoin1" while the very next
+        // injection into the same world carried "Gtr4". Sessions survive a world change,
+        // so this covers the gap; DmeIds do not, so this must NOT be keyed by DmeId.
+        private static readonly ConcurrentDictionary<string, string> _hotjoinNamesBySession =
+            new ConcurrentDictionary<string, string>();
+
         // Verified wire offsets inside the tNW_GameSettings blob (base = index of
         // "tNW_GameSetting" + 16). Only the first 0x100 bytes are confirmed to match
         // the in-memory GameSettings layout, so we touch nothing past PlayerStates.
@@ -255,28 +263,97 @@ namespace Server.Dme.Models
         /// joiner's immediate bail is caused by finding itself absent from the roster.
         /// Returns the original array unchanged if this is not a settings payload.
         /// </summary>
+        private int _injectBailLogged = 0;
+
+        // The host sends the FULL tNW_GameSettings snapshot (payload[3] == 0, ~470 bytes,
+        // carrying the "tNW_GameSetting" type name) exactly ONCE per world, when it first
+        // has someone to send it to. After that it sends only deltas (payload[3] == 1,
+        // ~20-38 bytes) which contain no roster at all. A rejoining client therefore
+        // arrives after the only full snapshot has already gone by, receives nothing it
+        // can build a roster from, never establishes gs, and dies on the host's verdict 4.
+        // Measured directly: `injected roster slot 1` once for the world, then
+        // `inject bail (no tNW_GameSetting)` for every reconnect after it.
+        //
+        // The server has already seen that snapshot, so keep it and serve it again to any
+        // client that has not had one this connection. Upgrading the first delta the host
+        // aims at them is the natural moment: the host is already talking to them, the
+        // cadence is right, and no new message has to be invented.
+        private byte[] _lastFullSettings = null;
+        private readonly HashSet<int> _fullSettingsSentTo = new HashSet<int>();
+
+        // The same one-shot pattern applies one layer down, to the tNW_Player
+        // registration (message 00-04). Measured across a session with two rejoins:
+        //     joiner -> host   00-04 broadcast on EVERY connect  (18:42:44/43:46/44:28)
+        //     host   -> joiner 00-04 sent ONCE                   (18:42:33, first join)
+        // so a rejoiner never learns the host's identity: its nwp[0] keeps cid=-1 and
+        // plist[0] stays NULL, which is exactly "I spawned in but we cannot see each
+        // other". Cache the host's registration and replay it alongside the settings.
+        private byte[] _lastPlayerReg = null;
+        private int _substitutions = 0;
+
+        private byte[] InjectBail(string why, byte[] payload)
+        {
+            // Rate-limited: the host sends settings continuously, so an unconditional log
+            // would drown everything else.
+            if (_injectBailLogged < 12)
+            {
+                _injectBailLogged++;
+                Logger.Info($"HOTJOIN PROBE: inject bail ({why}) world {WorldId}");
+            }
+            return payload;
+        }
+
         private byte[] TryInjectHotjoinSlot(byte[] payload, int slot)
         {
             if (payload == null || slot <= 0 || slot >= 8) return payload;
             if (payload.Length < 3 || payload[0] != 0x00 || payload[1] != 0x16 || payload[2] != 0x05) return payload;
 
+            // Everything past this point IS a settings blob aimed at a real joiner slot,
+            // so any bail below is worth knowing about. Measured on a rejoin: the host
+            // keeps sending 00-16-05 and the server keeps relaying it, but the injection
+            // ran exactly once for the world (at the first join) and never again -- so the
+            // joiner receives a roster with no slot for itself, never establishes gs, and
+            // the join dies on the host's verdict 4.
             int at = IndexOfPattern(payload, GS_TYPENAME);
-            if (at < 0) return payload;
+            if (at < 0)
+            {
+                // A delta. If this client has never had a full snapshot, substitute the
+                // cached one and inject into that instead.
+                byte[] full = _lastFullSettings;
+                if (full != null && !_fullSettingsSentTo.Contains(slot))
+                {
+                    Logger.Info($"HOTJOIN PROBE: substituting cached full settings ({full.Length} bytes) for slot {slot}, world {WorldId}");
+                    _substitutions++;
+                    return TryInjectHotjoinSlot(full, slot);
+                }
+                return InjectBail("no tNW_GameSetting", payload);
+            }
+
+            // A real snapshot -- keep it for the next joiner, and note this one has had it.
+            _lastFullSettings = (byte[])payload.Clone();
+            _fullSettingsSentTo.Add(slot);
 
             int gs = at + 16;
-            if (gs + GS_STATES + (slot * 2) + 2 > payload.Length) return payload;
+            if (gs + GS_STATES + (slot * 2) + 2 > payload.Length)
+                return InjectBail($"short payload {payload.Length} slot {slot}", payload);
 
             // Only rewrite when the host is actually in-game. An in-game host reports
             // PlayerStates[0] == 8 (one past GS_PLAYER_STATE_GAME_START). Without this
             // guard the probe would also rewrite ordinary staging joins and corrupt them.
             int hostState = payload[gs + GS_STATES] | (payload[gs + GS_STATES + 1] << 8);
-            if (hostState < 7) return payload;
+            if (hostState < 7) return InjectBail($"hostState {hostState} < 7, slot {slot}", payload);
 
             _hotjoinInGame = true;
 
             var patched = (byte[])payload.Clone();
 
             _hotjoinNames.TryGetValue(slot, out var name);
+            if (string.IsNullOrEmpty(name)
+                && Clients.TryGetValue(slot, out var slotClient)
+                && !string.IsNullOrEmpty(slotClient?.SessionKey))
+            {
+                _hotjoinNamesBySession.TryGetValue(slotClient.SessionKey, out name);
+            }
             if (string.IsNullOrEmpty(name)) name = "Hotjoin" + slot;
             var nameBytes = Encoding.ASCII.GetBytes(name);
             for (int i = 0; i < 16; ++i)
@@ -295,6 +372,25 @@ namespace Server.Dme.Models
             // worse: the staging screen then faults at 0x199c6c within two frames instead
             // of surviving staging and reaching the level load.
             WriteShort(GS_STATES, 0);            // GS_PLAYER_STATE_UNREADY
+
+            // PlayerCount is NOT on the wire. The settings blob is 0x190 bytes and its
+            // layout diverges from libuya's in-memory GameSettings after PlayerTypes --
+            // decoded from a live capture (gs = index of "tNW_GameSetting" + 16):
+            //
+            //   0x000 names[8][16]   0x080 clantags   0x0C0 skins   0x0D0 teams
+            //   0x0E0 clients        0x0F0 states     0x100 types
+            //   0x110 game option/rule bytes (0x20)
+            //   0x130 PlayerAccountIds[8]   (observed [5, -1 x7]; 5 is the host's account)
+            //   0x150 PlayerRanks[8]        (observed [1350.0, -1.0 x7])
+            //   0x170 PlayerRankDeviations[8] (observed [350.0, -1.0 x7])
+            //   0x190 end
+            //
+            // In memory libuya has Ranks 0x110 / Deviations 0x130 / AccountIds 0x150 and
+            // then GameStartTime, GameLoadStartTime, PlayerCount at 0x170/0x174/0x178 --
+            // three fields the wire format simply does not carry. So the joiner computes
+            // PlayerCount itself, and a guarded write here can never be right. The guard
+            // did its job (wire read back as 0xBF800000 = -1.0f, a RankDeviation) and
+            // nothing was written; the attempt is removed rather than left logging.
 
             // Clamp the in-game host's undocumented state 8 down to GAME_START (7), NOT
             // to READY. The joiner's staging handler decides whether to start loading with
@@ -345,7 +441,12 @@ namespace Server.Dme.Models
                 int end = 24;
                 while (end < Payload.Length && end < 24 + 16 && Payload[end] != 0) ++end;
                 if (end > 24)
-                    _hotjoinNames[source.DmeId] = Encoding.ASCII.GetString(Payload, 24, end - 24);
+                {
+                    var announced = Encoding.ASCII.GetString(Payload, 24, end - 24);
+                    _hotjoinNames[source.DmeId] = announced;
+                    if (!string.IsNullOrEmpty(source.SessionKey))
+                        _hotjoinNamesBySession[source.SessionKey] = announced;
+                }
             }
 
         }
@@ -412,8 +513,15 @@ namespace Server.Dme.Models
             // tNW_GameSettings snapshot, that snapshot has no slot for the joiner. Inject one
             // on the way through and see whether the joiner still bails.
             var outgoing = Payload;
+            int substBefore = _substitutions;
             if (source.DmeId == 0 && targetDmeId > 0)
+            {
+                // Remember the host's tNW_Player registration so it can be replayed.
+                if (Payload != null && Payload.Length > 4 && Payload[0] == 0x00 && Payload[1] == 0x04)
+                    _lastPlayerReg = (byte[])Payload.Clone();
+
                 outgoing = TryInjectHotjoinSlot(Payload, targetDmeId);
+            }
 
             if (target != null && target.IsAuthenticated && target.IsConnected && target.HasRecvFlag(RT_RECV_FLAG.RECV_SINGLE))
             {
@@ -422,6 +530,19 @@ namespace Server.Dme.Models
                     TargetOrSource = (short)source.DmeId,
                     Payload = outgoing
                 });
+
+                // A settings substitution means this client is being bootstrapped after
+                // the host's one-shot messages have already gone by. The registration is
+                // one-shot too, so replay it in the same breath.
+                if (_substitutions != substBefore && _lastPlayerReg != null)
+                {
+                    Logger.Info($"HOTJOIN PROBE: replaying cached tNW_Player ({_lastPlayerReg.Length} bytes) to slot {targetDmeId}, world {WorldId}");
+                    target.EnqueueTcp(new RT_MSG_CLIENT_APP_SINGLE()
+                    {
+                        TargetOrSource = 0,
+                        Payload = (byte[])_lastPlayerReg.Clone()
+                    });
+                }
             }
 
             TryAnswerHotjoinPoll(source, targetDmeId, Payload);
@@ -488,6 +609,8 @@ namespace Server.Dme.Models
         public async Task OnPlayerLeft(ClientObject player)
         {
             player.HasJoined = false;
+            // A reconnect under the same DmeId must be given the full snapshot again.
+            _fullSettingsSentTo.Remove(player.DmeId);
 
             // Plugin
             await Program.Plugins.OnEvent(PluginEvent.DME_PLAYER_ON_LEFT, new OnPlayerArgs()

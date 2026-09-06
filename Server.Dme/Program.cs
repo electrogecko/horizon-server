@@ -65,6 +65,10 @@ namespace Server.Dme
         static string metricPrintString = null;
         static int metricIndent = 0;
 
+        // True once the DME client listener has been observed bound. Gates the self-heal
+        // in TickAsync so it cannot fire during the initial asynchronous bind.
+        static bool _tcpEverBound = false;
+
         static async Task TickAsync()
         {
             try
@@ -73,6 +77,30 @@ namespace Server.Dme
                 if (!_sw.IsRunning)
                     _sw.Start();
 #endif
+
+                // Self-heal the client-facing listener.
+                //
+                // TcpServer.Start() is otherwise called exactly once, from
+                // StartServerAsync(), so anything that stops the listener stops it for
+                // the life of the process -- and the process stays alive, so the
+                // restart_dme.py watchdog (which only greps `ps aux`) never notices.
+                // Clients then get connection-refused on 10073 and can neither create
+                // nor join a game, while the log looks healthy.
+                //
+                // Only ever act on a true->false TRANSITION. Start() is `async void` and
+                // assigns _boundChannel after awaiting BindAsync, so IsRunning is still
+                // false for the first tick or two after a perfectly good Start(). An
+                // earlier version of this check fired on that and double-bound the port.
+                if (TcpServer.IsRunning)
+                {
+                    _tcpEverBound = true;
+                }
+                else if (_tcpEverBound)
+                {
+                    _tcpEverBound = false;   // re-armed when the rebind takes effect
+                    Logger.Warn($"TCP listener on port {TcpServer.Port} is down -- restarting it.");
+                    TcpServer.Start();
+                }
 
 #if DEBUG
                 ++_ticks;
@@ -196,7 +224,18 @@ namespace Server.Dme
                 Logger.Error(ex);
 
                 await Task.WhenAll(Managers.Select(x => x.Value.Stop()));
-                await TcpServer.Stop();
+
+                // Do NOT stop TcpServer here. It is the client-facing listener and has
+                // nothing to do with an MPS/manager fault, but stopping it was permanent
+                // (see the self-heal note at the top of this method).
+                //
+                // Observed: on a cold start DME binds 10073 successfully, then its first
+                // tick calls manager.Start() -> ConnectMPS() before Medius is accepting,
+                // which throws ClosedChannelException. That landed here and killed the
+                // listener. DME then reconnected to MPS seconds later and logged
+                // "Successfully authenticated with MPS", so the server looked fine while
+                // accepting no clients at all. A pure startup race: it bites only when
+                // Medius is slower than DME's first tick.
             }
         }
 
