@@ -1,4 +1,4 @@
-using DotNetty.Common.Internal.Logging;
+﻿using DotNetty.Common.Internal.Logging;
 using Microsoft.Extensions.Logging;
 using RT.Common;
 using RT.Models;
@@ -238,6 +238,25 @@ namespace Server.Dme.Models
         private const int GS_CLIENTS = 0xE0; // short[8]
         private const int GS_STATES = 0xF0;  // short[8]
 
+        // PROBE: tNW_Player registration (00-04) tracing.
+        //
+        // Measured on a failed hotjoin: the joiner had the host in nwp[0], but the
+        // host's nwp[1] stayed cid=-1 pData=00000000 for the whole session, so
+        // hjHostSpawnRemotes had nothing to build the remote player from and neither
+        // side ever exchanged a pad packet -- despite both rosters reading
+        // clients=0 1 states=8 8 and the peer handshake reaching state 5.
+        //
+        // The registration is one-shot. The replay added for the host->joiner
+        // direction only fires on a settings substitution, and nothing at all covers
+        // joiner->host. This says whether the joiner ever sent one.
+        private void TracePlayerReg(string how, int fromDmeId, int toDmeId, byte[] payload)
+        {
+            if (payload == null || payload.Length < 2 || payload[0] != 0x00 || payload[1] != 0x04)
+                return;
+
+            Logger.Info($"HOTJOIN REG: {how} 00-04 ({payload.Length} bytes) from {fromDmeId} to {toDmeId}, world {WorldId}");
+        }
+
         // Set once we have seen this world's host report an in-game roster.
         private volatile bool _hotjoinInGame = false;
 
@@ -347,14 +366,25 @@ namespace Server.Dme.Models
 
             var patched = (byte[])payload.Clone();
 
-            _hotjoinNames.TryGetValue(slot, out var name);
-            if (string.IsNullOrEmpty(name)
-                && Clients.TryGetValue(slot, out var slotClient)
-                && !string.IsNullOrEmpty(slotClient?.SessionKey))
-            {
+            // Prefer the account name Medius sent us in the join request. Both caches
+            // below are scraped from the joiner's 00-0F staging announce, and a mid-game
+            // joiner never sends one -- which is why the name kept arriving as
+            // "Hotjoin<slot>" no matter how many times the world had been played.
+            Clients.TryGetValue(slot, out var slotClient);
+            string name = slotClient?.AccountName;
+
+            // Staging-announce caches, kept as a fallback for anything that reaches this
+            // path without a Medius login on record.
+            if (string.IsNullOrEmpty(name))
+                _hotjoinNames.TryGetValue(slot, out name);
+            if (string.IsNullOrEmpty(name) && !string.IsNullOrEmpty(slotClient?.SessionKey))
                 _hotjoinNamesBySession.TryGetValue(slotClient.SessionKey, out name);
+
+            if (string.IsNullOrEmpty(name))
+            {
+                name = "Hotjoin" + slot;
+                Logger.Warn($"HOTJOIN: no name for slot {slot} (session {slotClient?.SessionKey ?? "none"}), world {WorldId} -- using {name}");
             }
-            if (string.IsNullOrEmpty(name)) name = "Hotjoin" + slot;
             var nameBytes = Encoding.ASCII.GetBytes(name);
             for (int i = 0; i < 16; ++i)
                 patched[gs + GS_NAMES + (slot * 16) + i] = i < nameBytes.Length ? nameBytes[i] : (byte)0;
@@ -425,13 +455,16 @@ namespace Server.Dme.Models
                 Payload = Payload
             };
 
+            int delivered = 0;
             foreach (var client in Clients)
             {
                 if (client.Value == source || !client.Value.IsAuthenticated || !client.Value.IsConnected || !client.Value.HasRecvFlag(RT_RECV_FLAG.RECV_BROADCAST))
                     continue;
 
                 client.Value.EnqueueTcp(msg);
+                ++delivered;
             }
+            TracePlayerReg($"broadcast to {delivered} of {Clients.Count}", source.DmeId, -1, Payload);
 
             // PROBE ONLY: remember the staging name a joining client announces (00-0F),
             // so an injected roster slot can carry the real name.
@@ -514,6 +547,7 @@ namespace Server.Dme.Models
             // on the way through and see whether the joiner still bails.
             var outgoing = Payload;
             int substBefore = _substitutions;
+            TracePlayerReg("single", source.DmeId, targetDmeId, Payload);
             if (source.DmeId == 0 && targetDmeId > 0)
             {
                 // Remember the host's tNW_Player registration so it can be replayed.
@@ -653,6 +687,10 @@ namespace Server.Dme.Models
             var existingClient = Clients.FirstOrDefault(x => x.Value.SessionKey == request.ConnectInfo.SessionKey);
             if (existingClient.Value != null)
             {
+                // Refresh the name in case this is a reconnect into the same world.
+                if (!string.IsNullOrEmpty(request.ConnectInfo.AccessKey))
+                    existingClient.Value.AccountName = request.ConnectInfo.AccessKey;
+
                 // found existing
                 return new MediusServerJoinGameResponse()
                 {
@@ -676,7 +714,7 @@ namespace Server.Dme.Models
 
             if (TryRegisterNewClientIndex(out var newClientIndex))
             {
-                if (!Clients.TryAdd(newClientIndex, newClient = new ClientObject(request.ConnectInfo.SessionKey, this, newClientIndex)))
+                if (!Clients.TryAdd(newClientIndex, newClient = new ClientObject(request.ConnectInfo.SessionKey, this, newClientIndex, request.ConnectInfo.AccessKey)))
                 {
                     UnregisterClientIndex(newClientIndex);
                     return new MediusServerJoinGameResponse()

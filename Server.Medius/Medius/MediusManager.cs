@@ -1,4 +1,4 @@
-using DotNetty.Common.Internal.Logging;
+﻿using DotNetty.Common.Internal.Logging;
 using RT.Common;
 using RT.Models;
 using Server.Medius.Models;
@@ -348,7 +348,18 @@ namespace Server.Medius
                         Type = NetConnectionType.NetConnectionTypeClientServerTCPAuxUDP,
                         WorldID = game.DMEWorldId,
                         SessionKey = client.SessionKey,
-                        ServerKey = Program.GlobalAuthPublic
+                        ServerKey = Program.GlobalAuthPublic,
+
+                        // Carry the account name to DME. DME knows a player only by
+                        // session key, and a mid-game hotjoiner never reaches the
+                        // staging screen whose 00-0F broadcast DME was scraping names
+                        // from -- so its injected roster slot had nothing but a
+                        // placeholder. AccessKey is a 17-byte fixed-width field that is
+                        // unused on the REQUEST side (DME issues its own token in the
+                        // response), so this rides along without changing a single byte
+                        // of the wire layout. Medius and DME are separate processes in
+                        // the same container, so a shared in-process map cannot work.
+                        AccessKey = client.AccountName
                     }
                 });
             }

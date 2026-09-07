@@ -61,6 +61,13 @@ namespace Server.Dme.Models
         public string SessionKey { get; protected set; } = null;
 
         /// <summary>
+        /// Account name as reported by Medius in the join request. DME does not
+        /// authenticate, so this is informational only -- it exists so a hotjoin roster
+        /// injection can name the player.
+        /// </summary>
+        public string AccountName { get; set; } = null;
+
+        /// <summary>
         /// 
         /// </summary>
         public int ApplicationId { get; set; } = 0;
@@ -156,10 +163,11 @@ namespace Server.Dme.Models
         private DateTime? _lastForceDisconnect = null;
         private int _isStopping = 0;
 
-        public ClientObject(string sessionKey, World dmeWorld, int dmeId)
+        public ClientObject(string sessionKey, World dmeWorld, int dmeId, string accountName = null)
         {
             // 
             SessionKey = sessionKey;
+            AccountName = accountName;
 
             // 
             this.DmeId = dmeId;
