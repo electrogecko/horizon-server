@@ -308,6 +308,28 @@ namespace Server.Dme.Models
         // plist[0] stays NULL, which is exactly "I spawned in but we cannot see each
         // other". Cache the host's registration and replay it alongside the settings.
         private byte[] _lastPlayerReg = null;
+
+        // s200 (2026-10-08): the above caches ONE registration and only when the source is
+        // the host (DmeId 0), while non-host peers register by BROADCAST, which was never
+        // cached at all. Consequence, reproduced deterministically on three machines: a
+        // REJOINER learns the host and nothing else. Its roster is correct (n=3,
+        // clients=0 1 2, all names) but vaPlayerStructArray[other joiner] stays NULL and
+        // that nwp entry is PRISTINE -- cid word -1, every other byte zero, never touched.
+        // The already-present joiner builds the rejoiner fine, so the failure is one-way.
+        // Keyed by source DmeId, fed from BOTH the single and broadcast paths, and every
+        // entry except the target's own is replayed when a client is bootstrapped.
+        private readonly Dictionary<int, byte[]> _playerRegBySource = new Dictionary<int, byte[]>();
+
+        private void RememberPlayerReg(int sourceDmeId, byte[] payload)
+        {
+            if (payload == null || payload.Length <= 4) return;
+            if (payload[0] != 0x00 || payload[1] != 0x04) return;
+            if (sourceDmeId < 0) return;
+
+            lock (_playerRegBySource)
+                _playerRegBySource[sourceDmeId] = (byte[])payload.Clone();
+        }
+
         private int _substitutions = 0;
 
         private byte[] InjectBail(string why, byte[] payload)
@@ -466,6 +488,10 @@ namespace Server.Dme.Models
             }
             TracePlayerReg($"broadcast to {delivered} of {Clients.Count}", source.DmeId, -1, Payload);
 
+            // s200: non-host peers register by BROADCAST, and this path cached nothing, so
+            // a bootstrapping client could never be told about them. Cache it here too.
+            RememberPlayerReg(source.DmeId, Payload);
+
             // PROBE ONLY: remember the staging name a joining client announces (00-0F),
             // so an injected roster slot can carry the real name.
             if (Payload != null && Payload.Length >= 40 && source.DmeId != 0
@@ -548,6 +574,9 @@ namespace Server.Dme.Models
             var outgoing = Payload;
             int substBefore = _substitutions;
             TracePlayerReg("single", source.DmeId, targetDmeId, Payload);
+            // s200: cache the registration whatever its source, not only the host's.
+            RememberPlayerReg(source.DmeId, Payload);
+
             if (source.DmeId == 0 && targetDmeId > 0)
             {
                 // Remember the host's tNW_Player registration so it can be replayed.
@@ -568,14 +597,38 @@ namespace Server.Dme.Models
                 // A settings substitution means this client is being bootstrapped after
                 // the host's one-shot messages have already gone by. The registration is
                 // one-shot too, so replay it in the same breath.
-                if (_substitutions != substBefore && _lastPlayerReg != null)
+                // s201: the ORIGINAL gate was `_substitutions != substBefore`, and
+                // `_substitutions` only increments on the DELTA-substitution path
+                // (`!_fullSettingsSentTo.Contains(slot)`). A client that receives a REAL
+                // full snapshot takes the other branch, which adds it to
+                // `_fullSettingsSentTo` and never touches `_substitutions` -- so for those
+                // clients the replay NEVER FIRED. Confirmed in the live log: the line
+                // "replaying cached tNW_Player" has never once appeared, while
+                // "injected roster slot N" appears on every join.
+                //
+                // The real bootstrap signal is simply that we REWROTE the payload for this
+                // target, by either route. Use that.
+                if (!ReferenceEquals(outgoing, Payload))
                 {
-                    Logger.Info($"HOTJOIN PROBE: replaying cached tNW_Player ({_lastPlayerReg.Length} bytes) to slot {targetDmeId}, world {WorldId}");
-                    target.EnqueueTcp(new RT_MSG_CLIENT_APP_SINGLE()
+                    // s200: replay EVERY peer's cached registration, not just the host's.
+                    // A rejoiner needs to be told about the other joiners too, or it will
+                    // never build them -- its nwp entry for them stays pristine.
+                    List<KeyValuePair<int, byte[]>> regs;
+                    lock (_playerRegBySource)
+                        regs = new List<KeyValuePair<int, byte[]>>(_playerRegBySource);
+
+                    foreach (var reg in regs)
                     {
-                        TargetOrSource = 0,
-                        Payload = (byte[])_lastPlayerReg.Clone()
-                    });
+                        if (reg.Key == targetDmeId) continue;   // never its own
+                        if (reg.Value == null) continue;
+
+                        Logger.Info($"HOTJOIN PROBE: replaying cached tNW_Player from {reg.Key} ({reg.Value.Length} bytes) to slot {targetDmeId}, world {WorldId}");
+                        target.EnqueueTcp(new RT_MSG_CLIENT_APP_SINGLE()
+                        {
+                            TargetOrSource = (short)reg.Key,
+                            Payload = (byte[])reg.Value.Clone()
+                        });
+                    }
                 }
             }
 
