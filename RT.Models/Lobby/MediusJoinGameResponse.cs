@@ -20,6 +20,10 @@ namespace RT.Models
         public MediusGameHostType GameHostType;
         public NetConnectionInfo ConnectInfo;
 
+        // UYA's native response parser includes NetConnectionInfo's alignment
+        // padding even when the connection negotiates Medius 108.
+        public bool PadLegacyConnectionInfo { get; set; }
+
         public override void Deserialize(Server.Common.Stream.MessageReader reader)
         {
             // 
@@ -51,6 +55,9 @@ namespace RT.Models
             writer.Write(StatusCode);
             writer.Write(GameHostType);
             writer.Write(ConnectInfo);
+
+            if (PadLegacyConnectionInfo && writer.MediusVersion <= 108)
+                writer.Write(new byte[2]);
 
             if (writer.MediusVersion >= 112)
                 writer.Write(new byte[4]);

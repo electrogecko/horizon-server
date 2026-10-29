@@ -250,6 +250,7 @@ namespace Server.Medius
                                 MessageID = new MessageId(msgId),
                                 StatusCode = MediusCallbackStatus.MediusSuccess,
                                 GameHostType = game.GameHostType,
+                                PadLegacyConnectionInfo = rClient.ApplicationId == 10683 || rClient.ApplicationId == 10684,
                                 ConnectInfo = new NetConnectionInfo()
                                 {
                                     AccessKey = joinGameResponse.AccessKey,
